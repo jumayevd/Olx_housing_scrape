@@ -3,6 +3,9 @@ name: OLX Housing Scraper
 on:
   workflow_dispatch:   # run manually from the Actions tab
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # silence Node.js 20 warnings
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -19,7 +22,7 @@ jobs:
         run: |
           pip install -r requirements.txt
           playwright install chromium
-          playwright install-deps chromium
+          sudo playwright install-deps chromium
 
       # Restore the checkpoint from the last run so the scraper resumes
       - name: Restore checkpoint
@@ -30,7 +33,9 @@ jobs:
           restore-keys: olx-checkpoint-
 
       - name: Run scraper
-        run: python scraper.py
+        run: |
+          mkdir -p output
+          python scraper.py
         env:
           MAX_PAGES: "999"
           OUTPUT_DIR: "./output"
