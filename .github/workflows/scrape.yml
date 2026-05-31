@@ -8,7 +8,7 @@ env:
 
 jobs:
   scrape:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 360   # 6-hour GitHub Actions limit
 
     steps:
