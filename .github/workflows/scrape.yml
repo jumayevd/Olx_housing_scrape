@@ -1,7 +1,12 @@
 name: OLX Housing Scraper
 
 on:
-  workflow_dispatch:   # run manually from the Actions tab
+  workflow_dispatch:
+    inputs:
+      max_pages:
+        description: "Pages to scrape (3 = quick test ~150 ads, 999 = all)"
+        default: "999"
+        required: false
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # silence Node.js 20 warnings
@@ -36,7 +41,7 @@ jobs:
           mkdir -p output
           python scraper.py
         env:
-          MAX_PAGES: "999"
+          MAX_PAGES: ${{ github.event.inputs.max_pages }}
           OUTPUT_DIR: "./output"
 
       # Upload output folder as an artifact — download from the Actions run page
