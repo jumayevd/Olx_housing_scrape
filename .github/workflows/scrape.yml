@@ -1,0 +1,45 @@
+name: OLX Housing Scraper
+
+on:
+  workflow_dispatch:   # run manually from the Actions tab
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6-hour GitHub Actions limit
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      # Restore the checkpoint from the last run so the scraper resumes
+      - name: Restore checkpoint
+        uses: actions/cache@v4
+        with:
+          path: output/
+          key: olx-checkpoint-${{ github.run_id }}
+          restore-keys: olx-checkpoint-
+
+      - name: Run scraper
+        run: python scraper.py
+        env:
+          MAX_PAGES: "999"
+          OUTPUT_DIR: "./output"
+
+      # Upload output folder as an artifact — download from the Actions run page
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        if: always()   # upload even if the scraper times out mid-run
+        with:
+          name: olx-housing-data-${{ github.run_number }}
+          path: output/
+          retention-days: 30
