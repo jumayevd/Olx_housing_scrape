@@ -9,15 +9,20 @@ on:
         required: false
 
 env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # silence Node.js 20 warnings
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   scrape:
     runs-on: ubuntu-22.04
-    timeout-minutes: 360   # 6-hour GitHub Actions limit
+    timeout-minutes: 330   # 5.5 hrs — 30 min buffer for cleanup steps before GitHub hard-kills at 6 hrs
+
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.SCRAPER_PAT }}
 
       - uses: actions/setup-python@v5
         with:
@@ -28,27 +33,73 @@ jobs:
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
-      # Restore the checkpoint from the last run so the scraper resumes
-      - name: Restore checkpoint
-        uses: actions/cache@v4
-        with:
-          path: output/
-          key: olx-checkpoint-${{ github.run_id }}
-          restore-keys: olx-checkpoint-
-
-      - name: Run scraper
+      - name: Restore checkpoint from git
         run: |
           mkdir -p output
-          python scraper.py
+          if [ -f checkpoint/checkpoint.json ]; then
+            cp checkpoint/checkpoint.json output/checkpoint.json
+            RECORDS=$(python -c "import json; cp=json.load(open('output/checkpoint.json')); print(len(cp.get('scraped_urls', [])))" 2>/dev/null || echo "?")
+            echo "Checkpoint restored — ${RECORDS} ads already scraped, resuming..."
+          else
+            echo "No checkpoint found — starting fresh"
+          fi
+
+      - name: Run scraper
+        run: python scraper.py
         env:
           MAX_PAGES: ${{ github.event.inputs.max_pages }}
           OUTPUT_DIR: "./output"
 
-      # Upload output folder as an artifact — download from the Actions run page
       - name: Upload results
         uses: actions/upload-artifact@v4
-        if: always()   # upload even if the scraper times out mid-run
+        if: always()
         with:
           name: olx-housing-data-${{ github.run_number }}
           path: output/
-          retention-days: 30
+          retention-days: 90
+
+      - name: Save checkpoint to git
+        if: always()
+        run: |
+          if [ ! -f output/checkpoint.json ]; then
+            echo "No checkpoint to save"
+            exit 0
+          fi
+          mkdir -p checkpoint
+          cp output/checkpoint.json checkpoint/checkpoint.json
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add checkpoint/checkpoint.json
+          git diff --cached --quiet && echo "Checkpoint unchanged" && exit 0
+          RECORDS=$(python -c "import json; cp=json.load(open('output/checkpoint.json')); print(len(cp.get('data', [])))" 2>/dev/null || echo "?")
+          git commit -m "chore: checkpoint — ${RECORDS} records [skip ci]"
+          git push
+
+      - name: Continue in next run if not done
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.SCRAPER_PAT }}
+        run: |
+          if [ ! -f output/checkpoint.json ]; then
+            echo "No checkpoint — nothing to continue"
+            exit 0
+          fi
+          PENDING=$(python -c "
+          import json
+          cp = json.load(open('output/checkpoint.json'))
+          pending = [u for u in cp.get('all_links', []) if u not in set(cp.get('scraped_urls', []))]
+          print(len(pending))
+          " 2>/dev/null || echo "0")
+          echo "Pending listings: ${PENDING}"
+          if [ "$PENDING" -gt "0" ]; then
+            echo "Triggering next run to continue scraping..."
+            gh workflow run scrape.yml \
+              --ref ${{ github.ref_name }} \
+              -f max_pages=${{ github.event.inputs.max_pages }}
+          else
+            echo "All listings scraped — removing checkpoint"
+            git config user.name  "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git rm --ignore-unmatch checkpoint/checkpoint.json
+            git diff --cached --quiet || git commit -m "chore: scrape complete — checkpoint cleared [skip ci]" && git push || true
+          fi
