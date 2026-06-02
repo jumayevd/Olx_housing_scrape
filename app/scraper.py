@@ -229,9 +229,18 @@ async def get_all_links(page, base_url, max_pages):
         print(f"── LIST PAGE {pg}/{max_pages}: {url}")
 
         for attempt in range(3):
-            await page.goto(url, wait_until="networkidle", timeout=60000)
-            await page.wait_for_timeout(random.randint(3000, 5000))
-            await human_scroll(page)
+            try:
+                try:
+                    await page.goto(url, wait_until="networkidle", timeout=45000)
+                except Exception:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(random.randint(3000, 5000))
+                await human_scroll(page)
+            except Exception as e:
+                wait_secs = (attempt + 1) * 10
+                print(f"   ✗ Page load error (attempt {attempt+1}/3): {e} — retrying in {wait_secs}s")
+                await asyncio.sleep(wait_secs)
+                continue
 
             page_title = (await page.title()).lower()
             body_text  = (await page.text_content("body") or "").lower()
