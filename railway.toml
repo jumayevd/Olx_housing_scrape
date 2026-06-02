@@ -2,6 +2,4 @@
 builder = "dockerfile"
 
 [deploy]
-# "never" — don't auto-restart when the scrape finishes normally.
-# If it crashes mid-run, redeploy manually; the checkpoint will resume.
-restartPolicyType = "never"
+restartPolicyType = "always"   # restart if the process crashes
