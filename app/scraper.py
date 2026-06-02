@@ -107,7 +107,15 @@ async def human_scroll(page, fast=False):
 def get_engine():
     if not DB_USER or not DB_PASS:
         raise RuntimeError("DB_USER and DB_PASS environment variables are required.")
-    url = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+    from sqlalchemy.engine import URL
+    url = URL.create(
+        drivername="postgresql+psycopg2",
+        username=DB_USER,
+        password=DB_PASS,
+        host=DB_HOST,
+        port=int(DB_PORT),
+        database=DB_NAME,
+    )
     return create_engine(url, pool_pre_ping=True)
 
 
