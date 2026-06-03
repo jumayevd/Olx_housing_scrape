@@ -190,6 +190,8 @@ def save_batch_to_db(data_list, engine):
 # BROWSER FACTORY
 # ─────────────────────────────────────────────────────────────────
 
+BLOCKED_RESOURCES = {"image", "media", "font", "stylesheet"}
+
 async def make_browser_page(p):
     browser = await p.chromium.launch(headless=True, slow_mo=80, args=CHROMIUM_ARGS)
     context = await browser.new_context(
@@ -203,6 +205,15 @@ async def make_browser_page(p):
         ),
     )
     page = await context.new_page()
+
+    # Block images, fonts, CSS — not needed for scraping, saves ~40% memory
+    async def block_resources(route):
+        if route.request.resource_type in BLOCKED_RESOURCES:
+            await route.abort()
+        else:
+            await route.continue_()
+    await page.route("**/*", block_resources)
+
     await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
         window.chrome = { runtime: {} };
