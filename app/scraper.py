@@ -39,7 +39,7 @@ LONG_BREAK_SECS       = (10, 15)
 SCROLL_PASSES         = (2, 3)
 SCROLL_DIST_PX        = (500, 1200)
 SCROLL_PAUSE          = (0.4, 0.9)
-BROWSER_RESTART_EVERY = 50
+BROWSER_RESTART_EVERY = 30
 
 CHROMIUM_ARGS = [
     "--no-sandbox",
@@ -648,10 +648,24 @@ async def run_scrape():
                     data = await scrape_ad(page, link)
                     break
                 except Exception as e:
-                    if "BLOCKED_403" in str(e):
+                    err = str(e)
+                    if "BLOCKED_403" in err:
                         wait = (attempt + 1) * 30
                         print(f"  BLOCKED — retry {attempt+1}/3 in {wait}s")
                         await asyncio.sleep(wait)
+                    elif any(x in err for x in [
+                        "Target page", "browser has been closed",
+                        "page has been closed", "Browser closed",
+                        "context or browser", "Target closed",
+                    ]):
+                        print(f"  Browser crashed — restarting (attempt {attempt+1}/3)")
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(5)
+                        browser, page = await make_browser_page(p)
+                        # loop continues → retries this listing with fresh browser
                     else:
                         print(f"  FAILED: {e}")
                         break
