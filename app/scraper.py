@@ -361,12 +361,17 @@ async def scrape_ad(page, url):
 
         # Title
         title = None
-        try:
-            h1 = page.locator("h1")
-            if await h1.count() > 0:
-                title = clean(await h1.first.inner_text())
-        except Exception:
-            pass
+        for sel in ["h1", '[data-cy="ad_title"]', '[data-testid="ad-title"]']:
+            try:
+                el = page.locator(sel)
+                if await el.count() > 0:
+                    title = clean(await el.first.inner_text())
+                    if title:
+                        break
+            except Exception:
+                pass
+        if not title:
+            title = clean(page_title.split(" - ")[0].split(" | ")[0])
 
         # Price & currency
         price = currency = None
@@ -429,6 +434,22 @@ async def scrape_ad(page, url):
                 pass
 
         views = views_holder["value"]
+        # Fallback: try page view counter element
+        if views is None:
+            for sel in ['[data-testid="page-view-counter"]', '[data-cy="view-count"]', '[class*="view-count"]']:
+                try:
+                    el = page.locator(sel)
+                    if await el.count() > 0:
+                        views = extract_number(await el.first.inner_text())
+                        if views:
+                            break
+                except Exception:
+                    pass
+        # Fallback: regex on body
+        if views is None and bt:
+            m = re.search(r"(\d+)\s*(?:просмотр|view)", bt, re.I)
+            if m:
+                views = int(m.group(1))
 
         # Posted date
         posted_date = None
