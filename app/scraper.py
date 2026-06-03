@@ -632,6 +632,26 @@ async def scrape_ad(page, url):
 
 
 # ─────────────────────────────────────────────────────────────────
+# BROWSER WARMUP  — establish cookies/session before hitting ad pages
+# ─────────────────────────────────────────────────────────────────
+
+async def warmup_browser(page):
+    """Visit the OLX homepage so the browser has a valid session before ad pages."""
+    try:
+        print("  [browser] warming up session on OLX homepage...")
+        await page.goto("https://www.olx.uz/", wait_until="domcontentloaded", timeout=30000)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(random.randint(3000, 5000))
+        await human_scroll(page)
+        print("  [browser] session ready.")
+    except Exception as e:
+        print(f"  [browser] warmup failed (continuing anyway): {e}")
+
+
+# ─────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────
 
@@ -659,6 +679,7 @@ async def run_scrape():
 
         # Step 2: scrape each ad
         browser, page = await make_browser_page(p)
+        await warmup_browser(page)
 
         for idx, link in enumerate(all_links, start=1):
             ad_counter += 1
@@ -669,14 +690,18 @@ async def run_scrape():
                     await browser.close()
                 except Exception:
                     pass
-                await asyncio.sleep(3)
+                await asyncio.sleep(5)
                 browser, page = await make_browser_page(p)
+                await warmup_browser(page)
 
             print(f"[{idx}/{len(all_links)}] {link.split('/')[-1][:60]}")
             data = None
             for attempt in range(3):
                 try:
                     data = await scrape_ad(page, link)
+                    # If page loaded but rendered nothing, treat as a failed render
+                    if data and not data.get("title") and not data.get("price"):
+                        raise Exception("RENDER_FAILED")
                     break
                 except Exception as e:
                     err = str(e)
@@ -684,6 +709,12 @@ async def run_scrape():
                         wait = (attempt + 1) * 30
                         print(f"  BLOCKED — retry {attempt+1}/3 in {wait}s")
                         await asyncio.sleep(wait)
+                    elif "RENDER_FAILED" in err:
+                        wait = (attempt + 1) * 10
+                        print(f"  Page rendered empty — retry {attempt+1}/3 in {wait}s")
+                        await asyncio.sleep(wait)
+                        # don't reset data — let next attempt overwrite
+                        data = None
                     elif any(x in err for x in [
                         "Target page", "browser has been closed",
                         "page has been closed", "Browser closed",
@@ -696,7 +727,7 @@ async def run_scrape():
                             pass
                         await asyncio.sleep(5)
                         browser, page = await make_browser_page(p)
-                        # loop continues → retries this listing with fresh browser
+                        await warmup_browser(page)
                     else:
                         print(f"  FAILED: {e}")
                         break
