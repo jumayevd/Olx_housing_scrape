@@ -326,9 +326,23 @@ async def get_all_links(p, base_url, max_pages):
 async def get_attrs(page):
     attrs = {}
     try:
-        container = page.locator('[data-nx-name="ListContainer"]')
-        if await container.count() == 0:
+        # Try known container selectors in order
+        container = None
+        for sel in [
+            '[data-nx-name="ListContainer"]',
+            '[data-testid="ad-parameters"]',
+            '[data-cy="ad-parameters"]',
+            'ul[class*="parameter"]',
+            'ul[class*="Parameter"]',
+        ]:
+            loc = page.locator(sel)
+            if await loc.count() > 0:
+                container = loc.first
+                break
+
+        if container is None:
             return attrs
+
         rows  = container.locator("li, p")
         count = await rows.count()
         for i in range(count):
@@ -372,9 +386,14 @@ async def scrape_ad(page, url):
 
         page.on("response", handle_response)
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        # Wait for React to render the listing — h1 appearing means content is ready
+        try:
+            await page.wait_for_selector("h1", timeout=15000)
+        except Exception:
+            pass
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
         await human_scroll(page)
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(1.0)
         page.remove_listener("response", handle_response)
 
         page_title = await page.title()
