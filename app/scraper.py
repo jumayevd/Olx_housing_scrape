@@ -20,7 +20,6 @@ from sqlalchemy import create_engine, text
 # ─────────────────────────────────────────────────────────────────
 BASE_URL   = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS"
 MAX_PAGES  = 25
-BATCH_SIZE = 5
 
 DB_USER    = os.environ.get("DB_USER")
 DB_PASS    = os.environ.get("DB_PASS")
@@ -30,26 +29,28 @@ DB_NAME    = os.environ.get("DB_NAME", "postgres")
 TABLE_NAME = "olx_listings"
 
 # ─────────────────────────────────────────────────────────────────
-# TIMING
+# TIMING  — tuned for completeness, not speed
 # ─────────────────────────────────────────────────────────────────
-AD_WAIT_MS            = (1800, 3500)
-BETWEEN_ADS           = (2.0, 4.0)
-BETWEEN_LIST          = (4.0, 8.0)
+AD_WAIT_MS            = (3000, 6000)   # buffer after page load
+BETWEEN_ADS           = (3.0, 6.0)
+BETWEEN_LIST          = (5.0, 10.0)
 LONG_BREAK_EVERY      = 15
-LONG_BREAK_SECS       = (10, 15)
+LONG_BREAK_SECS       = (15, 25)
 SCROLL_PASSES         = (2, 3)
 SCROLL_DIST_PX        = (500, 1200)
 SCROLL_PAUSE          = (0.4, 0.9)
-BROWSER_RESTART_EVERY = 30
+BROWSER_RESTART_EVERY = 20
+BATCH_SIZE            = 1             # save every listing immediately
 
 CHROMIUM_ARGS = [
+    # Required for headless on Linux/Railway
     "--no-sandbox",
-    "--disable-dev-shm-usage",
-    "--disable-gpu",
     "--disable-setuid-sandbox",
-    "--single-process",
-    "--no-zygote",
+    "--disable-dev-shm-usage",
+    # GPU not needed in headless
+    "--disable-gpu",
     "--disable-accelerated-2d-canvas",
+    # Misc hardening / noise reduction
     "--disable-web-security",
     "--disable-extensions",
     "--disable-background-networking",
@@ -61,7 +62,9 @@ CHROMIUM_ARGS = [
     "--mute-audio",
     "--no-first-run",
     "--safebrowsing-disable-auto-update",
-    "--js-flags=--max-old-space-size=256",
+    # NOTE: --single-process, --no-zygote, and --js-flags=--max-old-space-size
+    # were removed — they cap V8 heap at 256 MB which silently breaks React
+    # rendering on heavier listing pages, causing null fields.
 ]
 
 
@@ -386,14 +389,19 @@ async def scrape_ad(page, url):
 
         page.on("response", handle_response)
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        # Wait for React to render the listing — h1 appearing means content is ready
+        # Let the network settle so OLX's API calls finish loading listing data
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        # Confirm React has rendered — h1 visible means content is in the DOM
         try:
             await page.wait_for_selector("h1", timeout=15000)
         except Exception:
             pass
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
         await human_scroll(page)
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(2.0)
         page.remove_listener("response", handle_response)
 
         page_title = await page.title()
