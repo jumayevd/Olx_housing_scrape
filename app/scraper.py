@@ -19,7 +19,7 @@ from sqlalchemy import create_engine, text
 # ─────────────────────────────────────────────────────────────────
 BASE_URL   = "https://www.olx.uz/nedvizhimost/kvartiry/prodazha/?currency=UZS"
 MAX_PAGES  = 25
-BATCH_SIZE = 15
+BATCH_SIZE = 5
 
 DB_USER    = os.environ.get("DB_USER")
 DB_PASS    = os.environ.get("DB_PASS")
@@ -221,8 +221,10 @@ def page_url(base, page_num):
     return f"{base}{sep}page={page_num}" if page_num > 1 else base
 
 
-async def get_all_links(page, base_url, max_pages):
+async def get_all_links(p, base_url, max_pages):
+    """Collect listing URLs across all pages. Restarts browser if it crashes."""
     all_links = set()
+    browser, page = await make_browser_page(p)
 
     for pg in range(1, max_pages + 1):
         url = page_url(base_url, pg)
@@ -237,9 +239,14 @@ async def get_all_links(page, base_url, max_pages):
                 await page.wait_for_timeout(random.randint(3000, 5000))
                 await human_scroll(page)
             except Exception as e:
-                wait_secs = (attempt + 1) * 10
-                print(f"   ✗ Page load error (attempt {attempt+1}/3): {e} — retrying in {wait_secs}s")
-                await asyncio.sleep(wait_secs)
+                print(f"   ✗ Error (attempt {attempt+1}/3): {e}")
+                # Browser may have crashed — restart it
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                await asyncio.sleep(10)
+                browser, page = await make_browser_page(p)
                 continue
 
             page_title = (await page.title()).lower()
@@ -263,6 +270,11 @@ async def get_all_links(page, base_url, max_pages):
 
         if pg < max_pages:
             await short_delay(*BETWEEN_LIST)
+
+    try:
+        await browser.close()
+    except Exception:
+        pass
 
     return list(all_links)
 
@@ -550,16 +562,10 @@ async def run_scrape():
     ad_counter = 0
 
     async with async_playwright() as p:
-        # Step 1: collect links
-        browser, page = await make_browser_page(p)
-        print("Warming session...")
-        await page.goto("https://www.olx.uz/", wait_until="domcontentloaded")
-        await short_delay(3, 5)
-        await human_scroll(page, fast=True)
-
-        all_links = list(set(await get_all_links(page, BASE_URL, MAX_PAGES)))
+        # Step 1: collect links (browser managed inside get_all_links)
+        print("Collecting listing links...")
+        all_links = list(set(await get_all_links(p, BASE_URL, MAX_PAGES)))
         print(f"\nTotal unique links: {len(all_links)}")
-        await browser.close()
 
         # Step 2: scrape each ad
         browser, page = await make_browser_page(p)
