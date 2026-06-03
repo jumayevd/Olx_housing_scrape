@@ -190,7 +190,7 @@ def save_batch_to_db(data_list, engine):
 # BROWSER FACTORY
 # ─────────────────────────────────────────────────────────────────
 
-BLOCKED_RESOURCES = {"image", "media", "font", "stylesheet"}
+BLOCKED_RESOURCES = {"image", "media"}
 
 async def make_browser_page(p):
     browser = await p.chromium.launch(headless=True, slow_mo=80, args=CHROMIUM_ARGS)
@@ -248,6 +248,11 @@ async def get_all_links(p, base_url, max_pages):
                 except Exception:
                     await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(random.randint(3000, 5000))
+                # Wait for ad cards to actually render
+                try:
+                    await page.wait_for_selector("a[href*='/d/obyavlenie/']", timeout=15000)
+                except Exception:
+                    pass
                 await human_scroll(page)
             except Exception as e:
                 print(f"   ✗ Error (attempt {attempt+1}/3): {e}")
