@@ -4,6 +4,7 @@ Scrapes apartment listings from olx.uz and upserts into Supabase.
 """
 
 import asyncio
+import json
 import math
 import random
 import re
@@ -365,6 +366,137 @@ async def get_attrs(page):
 
 
 # ─────────────────────────────────────────────────────────────────
+# __NEXT_DATA__ EXTRACTOR  — primary data source, server-rendered JSON
+# ─────────────────────────────────────────────────────────────────
+
+# Mapping from OLX param keys → our field names
+PARAM_KEY_MAP = {
+    # rooms
+    "rooms": "num_rooms", "number_of_rooms": "num_rooms", "kolichestvo_komnat": "num_rooms",
+    # area
+    "total_area": "area", "area": "area", "obshchaya_ploshchad": "area",
+    "floor_space": "area",
+    # floor / stair
+    "floor": "stair", "etazh": "stair", "floor_number": "stair",
+    # market type
+    "market_type": "market_type", "flat_type": "market_type", "tip_zhilya": "market_type",
+    "type_building": "market_type",
+}
+
+def _deep_get(d, *keys, default=None):
+    for k in keys:
+        if not isinstance(d, dict):
+            return default
+        d = d.get(k, default)
+        if d is default:
+            return default
+    return d
+
+
+async def extract_from_next_data(page):
+    """
+    Pull listing fields from the __NEXT_DATA__ JSON blob.
+    OLX.uz is Next.js — all listing data is server-rendered into this tag,
+    so it's always present regardless of React render timing.
+    Returns a dict of whatever fields were found (may be partial).
+    """
+    result = {}
+    try:
+        raw = await page.evaluate(
+            "() => document.getElementById('__NEXT_DATA__')?.textContent"
+        )
+        if not raw:
+            return result
+
+        nd = json.loads(raw)
+
+        # OLX Next.js path: props → pageProps → ad (or listing / adDetails)
+        page_props = _deep_get(nd, "props", "pageProps", default={})
+        ad = (
+            page_props.get("ad")
+            or page_props.get("listing")
+            or page_props.get("adDetails")
+            or {}
+        )
+
+        if not ad:
+            # Log first 300 chars of top-level keys so we can tune if needed
+            print(f"  [__NEXT_DATA__] ad key not found. top keys: {list(nd.get('props',{}).get('pageProps',{}).keys())[:10]}")
+            return result
+
+        # ── Title ────────────────────────────────────────────────
+        result["title"] = clean(ad.get("title"))
+
+        # ── Price ────────────────────────────────────────────────
+        price_obj = ad.get("price") or {}
+        if isinstance(price_obj, dict):
+            raw_price = (
+                price_obj.get("value")
+                or _deep_get(price_obj, "regularPrice", "value")
+            )
+            result["price"] = int(raw_price) if raw_price else None
+            cur = (
+                price_obj.get("currency")
+                or _deep_get(price_obj, "regularPrice", "currency")
+                or ""
+            ).upper()
+            if cur:
+                result["currency"] = "USD" if cur in ("USD", "У.Е.", "UE") else "UZS" if cur in ("UZS", "SUM") else cur
+        result["negotiation"] = bool(ad.get("negotiable") or ad.get("is_negotiable"))
+
+        # ── Params / attributes ──────────────────────────────────
+        params = ad.get("params") or ad.get("parameters") or []
+        for param in params:
+            key   = str(param.get("key") or param.get("name") or "").lower()
+            val   = param.get("value") or {}
+            label = (val.get("label") if isinstance(val, dict) else str(val)) or ""
+            field = PARAM_KEY_MAP.get(key)
+            if field == "num_rooms":
+                result["num_rooms"] = extract_number(label)
+            elif field == "area":
+                result["area"] = clean(label)
+            elif field == "stair":
+                result["stair"] = clean(label)
+            elif field == "market_type":
+                result["market_type"] = clean(label)
+
+        # ── Location ─────────────────────────────────────────────
+        loc = ad.get("location") or ad.get("map") or {}
+        city     = _deep_get(loc, "city",     "name", default="")
+        district = _deep_get(loc, "district", "name", default="")
+        region   = _deep_get(loc, "region",   "name", default="")
+        parts = [x for x in [city, district, region] if x]
+        if parts:
+            result["location"] = ", ".join(parts)
+
+        # ── Description ──────────────────────────────────────────
+        result["description"] = clean(ad.get("description"))
+
+        # ── Seller ───────────────────────────────────────────────
+        user = ad.get("user") or ad.get("contact") or {}
+        result["seller"] = clean(user.get("name"))
+        created = user.get("created_at") or user.get("member_since") or ""
+        if created:
+            result["seller_joined"] = clean(str(created))
+
+        # ── Posted date ──────────────────────────────────────────
+        posted = ad.get("created_at") or ad.get("last_refresh_time") or ""
+        if posted:
+            result["posted_date"] = clean(str(posted))
+
+        # ── Views ────────────────────────────────────────────────
+        views = _deep_get(ad, "statistics", "page_views", default=None)
+        if views is not None:
+            result["views"] = int(views)
+
+    except Exception as e:
+        print(f"  [__NEXT_DATA__] error: {e}")
+
+    # Strip None values so we only return what we actually found
+    return {k: v for k, v in result.items() if v is not None}
+
+
+# ─────────────────────────────────────────────────────────────────
 # SCRAPE ONE AD
 # ─────────────────────────────────────────────────────────────────
 
@@ -389,12 +521,10 @@ async def scrape_ad(page, url):
 
         page.on("response", handle_response)
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        # Let the network settle so OLX's API calls finish loading listing data
         try:
             await page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             pass
-        # Confirm React has rendered — h1 visible means content is in the DOM
         try:
             await page.wait_for_selector("h1", timeout=15000)
         except Exception:
@@ -410,99 +540,129 @@ async def scrape_ad(page, url):
                 or "403 error" in body_snippet or "access denied" in body_snippet:
             raise Exception("BLOCKED_403")
 
-        # Listing ID
+        # ── Listing ID (always from URL as primary) ───────────────
         listing_id = None
-        try:
-            label2 = page.locator('[data-nx-name="Label2"]')
-            if await label2.count() > 0:
-                raw = clean(await label2.first.inner_text()) or ""
-                m = re.search(r"(\d{5,})", raw)
-                if m:
-                    listing_id = m.group(1)
-        except Exception:
-            pass
+        m = re.search(r"-(ID[A-Za-z0-9]+)\.html", url)
+        if m:
+            listing_id = m.group(1)
         if not listing_id:
-            m = re.search(r"-(ID[A-Za-z0-9]+)\.html", url)
-            if m:
-                listing_id = m.group(1)
-
-        # Title
-        title = None
-        for sel in ["h1", '[data-cy="ad_title"]', '[data-testid="ad-title"]']:
             try:
-                el = page.locator(sel)
-                if await el.count() > 0:
-                    title = clean(await el.first.inner_text())
-                    if title:
-                        break
+                label2 = page.locator('[data-nx-name="Label2"]')
+                if await label2.count() > 0:
+                    raw = clean(await label2.first.inner_text()) or ""
+                    m2 = re.search(r"(\d{5,})", raw)
+                    if m2:
+                        listing_id = m2.group(1)
             except Exception:
                 pass
+
+        # ── PRIMARY: extract everything from __NEXT_DATA__ ────────
+        nd = await extract_from_next_data(page)
+        nd_hit = bool(nd.get("title") or nd.get("price"))
+        print(f"  [__NEXT_DATA__] {'HIT' if nd_hit else 'MISS'} — "
+              f"fields: {[k for k,v in nd.items() if v is not None]}")
+
+        title       = nd.get("title")
+        price       = nd.get("price")
+        currency    = nd.get("currency")
+        area        = nd.get("area")
+        num_rooms   = nd.get("num_rooms")
+        market_type = nd.get("market_type")
+        stair       = nd.get("stair")
+        negotiation = nd.get("negotiation", False)
+        seller      = nd.get("seller")
+        seller_joined = nd.get("seller_joined")
+        location    = nd.get("location")
+        description = nd.get("description")
+        posted_date = nd.get("posted_date")
+        views       = nd.get("views") or views_holder["value"]
+
+        # ── FALLBACK: DOM scraping for anything still missing ─────
         if not title:
-            title = clean(page_title.split(" - ")[0].split(" | ")[0])
+            for sel in ["h1", '[data-cy="ad_title"]', '[data-testid="ad-title"]']:
+                try:
+                    el = page.locator(sel)
+                    if await el.count() > 0:
+                        title = clean(await el.first.inner_text())
+                        if title:
+                            break
+                except Exception:
+                    pass
+            if not title:
+                title = clean(page_title.split(" - ")[0].split(" | ")[0])
 
-        # Price & currency
-        price = currency = None
-        try:
-            price_loc  = page.locator('[data-testid="ad-price-container"]')
-            price_text = ""
-            if await price_loc.count() > 0:
-                price_text = clean(await price_loc.first.inner_text()) or ""
-            price = extract_number(price_text)
-            low = price_text.lower()
-            if "$" in price_text or "у.е" in low or "usd" in low:
-                currency = "USD"
-            elif "сум" in low or "uzs" in low or "sum" in low:
-                currency = "UZS"
-        except Exception:
-            pass
+        if not price or not currency:
+            try:
+                price_loc  = page.locator('[data-testid="ad-price-container"]')
+                if await price_loc.count() > 0:
+                    price_text = clean(await price_loc.first.inner_text()) or ""
+                    if not price:
+                        price = extract_number(price_text)
+                    if not currency:
+                        low = price_text.lower()
+                        if "$" in price_text or "у.е" in low or "usd" in low:
+                            currency = "USD"
+                        elif "сум" in low or "uzs" in low or "sum" in low:
+                            currency = "UZS"
+            except Exception:
+                pass
 
-        # Structured attrs
-        attrs = await get_attrs(page)
-
-        def pick(keys):
-            for k in keys:
-                if attrs.get(k):
-                    return attrs[k]
-            return None
-
-        area        = clean(pick(["Общая площадь", "Umumiy maydoni", "Умумий майдони"]))
-        num_rooms   = extract_number(pick(["Количество комнат", "Xonalar soni", "Xona soni"]))
-        market_type = clean(pick(["Тип жилья", "Uy-joy turi"]))
-        stair       = clean(pick(["Этаж", "Qavat"]))
-
-        # Body text fallback
-        bt = ""
         if not all([area, num_rooms, stair, market_type]):
+            attrs = await get_attrs(page)
+            def pick(keys):
+                for k in keys:
+                    if attrs.get(k):
+                        return attrs[k]
+                return None
+            if not area:
+                area = clean(pick(["Общая площадь", "Umumiy maydoni", "Умумий майдони"]))
+            if not num_rooms:
+                num_rooms = extract_number(pick(["Количество комнат", "Xonalar soni", "Xona soni"]))
+            if not market_type:
+                market_type = clean(pick(["Тип жилья", "Uy-joy turi"]))
+            if not stair:
+                stair = clean(pick(["Этаж", "Qavat"]))
+
+        # Body text: last-resort regex fallback for structured fields
+        bt = ""
+        if not all([area, num_rooms, stair, market_type, description, posted_date]):
             try:
                 bt = clean(await page.text_content("body")) or ""
-                if not area:
-                    m = re.search(r"Общая площадь[:\s]*([^\n\r]{1,30}?)(?=\s*(?:Этаж|Количество|Тип|$))", bt, re.I)
-                    if m:
-                        val = clean(m.group(1))
-                        if val and re.search(r"\d", val) and len(val) < 30:
-                            area = val
-                if not num_rooms:
-                    m = re.search(r"Количество комнат[:\s]*(\d+)", bt, re.I)
-                    if m:
-                        num_rooms = int(m.group(1))
-                if not market_type:
-                    m = re.search(r"Тип жилья[:\s]*([^\n\r]{1,60}?)(?=\s*(?:Этаж|Количество|Общая|$))", bt, re.I)
-                    if m:
-                        val = clean(m.group(1))
-                        if val and len(val) < 60:
-                            market_type = val
-                if not stair:
-                    m = re.search(r"\bЭтаж[:\s]*([^\n\r]{1,30}?)(?=\s*(?:Количество|Общая|Тип|$))", bt, re.I)
-                    if m:
-                        val = clean(m.group(1))
-                        if val and len(val) < 30:
-                            stair = val
             except Exception:
                 pass
 
-        views = views_holder["value"]
-        # Fallback: try page view counter element
-        if views is None:
+        if bt:
+            if not area:
+                m = re.search(r"Общая площадь[:\s]*([^\n\r]{1,30}?)(?=\s*(?:Этаж|Количество|Тип|$))", bt, re.I)
+                if m:
+                    val = clean(m.group(1))
+                    if val and re.search(r"\d", val) and len(val) < 30:
+                        area = val
+            if not num_rooms:
+                m = re.search(r"Количество комнат[:\s]*(\d+)", bt, re.I)
+                if m:
+                    num_rooms = int(m.group(1))
+            if not market_type:
+                m = re.search(r"Тип жилья[:\s]*([^\n\r]{1,60}?)(?=\s*(?:Этаж|Количество|Общая|$))", bt, re.I)
+                if m:
+                    val = clean(m.group(1))
+                    if val and len(val) < 60:
+                        market_type = val
+            if not stair:
+                m = re.search(r"\bЭтаж[:\s]*([^\n\r]{1,30}?)(?=\s*(?:Количество|Общая|Тип|$))", bt, re.I)
+                if m:
+                    val = clean(m.group(1))
+                    if val and len(val) < 30:
+                        stair = val
+            if not posted_date:
+                m = re.search(r"Опубликовано[:\s]*([^\n\r]{3,40})", bt, re.I)
+                if m:
+                    posted_date = clean(m.group(1))
+            if not negotiation:
+                if "договорная" in bt.lower() or "negotiable" in bt.lower():
+                    negotiation = True
+
+        if not views:
             for sel in ['[data-testid="page-view-counter"]', '[data-cy="view-count"]', '[class*="view-count"]']:
                 try:
                     el = page.locator(sel)
@@ -512,82 +672,58 @@ async def scrape_ad(page, url):
                             break
                 except Exception:
                     pass
-        # Fallback: regex on body
-        if views is None and bt:
-            m = re.search(r"(\d+)\s*(?:просмотр|view)", bt, re.I)
-            if m:
-                views = int(m.group(1))
-
-        # Posted date
-        posted_date = None
-        try:
-            date_loc = page.locator('[data-cy="ad-posted-at"], [data-testid="ad-posted-at"]')
-            if await date_loc.count() > 0:
-                posted_date = clean(await date_loc.first.inner_text())
-            elif bt:
-                m = re.search(r"Опубликовано[:\s]*([^\n\r]{3,40})", bt, re.I)
+            if not views and bt:
+                m = re.search(r"(\d+)\s*(?:просмотр|view)", bt, re.I)
                 if m:
-                    posted_date = clean(m.group(1))
-        except Exception:
-            pass
+                    views = int(m.group(1))
 
-        # Negotiation
-        negotiation = False
-        try:
-            p4 = page.locator('[data-nx-name="P4"]')
-            if await p4.count() > 0:
-                p4_text = (clean(await p4.first.inner_text()) or "").lower()
-                if any(x in p4_text for x in ["договорная", "negotiable", "kelishiladi"]):
-                    negotiation = True
-            if not negotiation and bt:
-                if "договорная" in bt.lower() or "negotiable" in bt.lower():
-                    negotiation = True
-        except Exception:
-            pass
+        if not posted_date:
+            try:
+                date_loc = page.locator('[data-cy="ad-posted-at"], [data-testid="ad-posted-at"]')
+                if await date_loc.count() > 0:
+                    posted_date = clean(await date_loc.first.inner_text())
+            except Exception:
+                pass
 
-        # Seller
-        seller = None
-        try:
-            sl = page.locator('[data-testid="user-profile-user-name"]')
-            if await sl.count() > 0:
-                seller = clean(await sl.first.inner_text())
-        except Exception:
-            pass
+        if not seller:
+            try:
+                sl = page.locator('[data-testid="user-profile-user-name"]')
+                if await sl.count() > 0:
+                    seller = clean(await sl.first.inner_text())
+            except Exception:
+                pass
 
-        # Location
-        location = None
-        try:
-            texts = await page.locator("p, span").all_inner_texts()
-            for t in texts:
-                t = clean(t)
-                if not t:
-                    continue
-                if any(x in t.lower() for x in ["район", "ташкент", "toshkent", "область"]):
-                    if len(t) < 120:
-                        location = t
-                        break
-        except Exception:
-            pass
+        if not seller_joined:
+            try:
+                ms = page.locator('[data-testid="member-since"]')
+                if await ms.count() > 0:
+                    seller_joined = clean(await ms.first.inner_text())
+            except Exception:
+                pass
 
-        # Seller joined
-        seller_joined = None
-        try:
-            ms = page.locator('[data-testid="member-since"]')
-            if await ms.count() > 0:
-                seller_joined = clean(await ms.first.inner_text())
-        except Exception:
-            pass
+        if not location:
+            try:
+                texts = await page.locator("p, span").all_inner_texts()
+                for t in texts:
+                    t = clean(t)
+                    if not t:
+                        continue
+                    if any(x in t.lower() for x in ["район", "ташкент", "toshkent", "область"]):
+                        if len(t) < 120:
+                            location = t
+                            break
+            except Exception:
+                pass
 
-        # Description
-        description = None
-        try:
-            dl = page.locator('[data-testid="ad_description"]')
-            if await dl.count() > 0:
-                description = clean(await dl.first.inner_text())
-        except Exception:
-            pass
+        if not description:
+            try:
+                dl = page.locator('[data-testid="ad_description"]')
+                if await dl.count() > 0:
+                    description = clean(await dl.first.inner_text())
+            except Exception:
+                pass
 
-        # Description fallbacks
+        # Description → last-resort field inference
         if description:
             desc_low = description.lower()
             if not area:
