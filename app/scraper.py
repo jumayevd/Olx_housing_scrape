@@ -4,6 +4,7 @@ Scrapes apartment listings from olx.uz and upserts into Supabase.
 """
 
 import asyncio
+import math
 import random
 import re
 import os
@@ -160,9 +161,12 @@ def save_batch_to_db(data_list, engine):
     ]
     df = pd.DataFrame(data_list)
     df = df[[c for c in col_order if c in df.columns]]
-    # Replace NaN/NaT with None so Postgres doesn't choke on numeric columns
-    df = df.where(pd.notna(df), other=None)
     records = df.to_dict(orient="records")
+    # pandas converts None back to NaN for numeric columns — fix each value explicitly
+    for rec in records:
+        for k, v in rec.items():
+            if isinstance(v, float) and math.isnan(v):
+                rec[k] = None
 
     saved = 0
     failed = 0
