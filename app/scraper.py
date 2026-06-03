@@ -279,7 +279,16 @@ async def get_all_links(p, base_url, max_pages):
             for href in hrefs:
                 if href and "/d/obyavlenie/" in href:
                     all_links.add(href.split("?")[0])
-            print(f"   +{len(all_links) - before} new  (total {len(all_links)})")
+            gained = len(all_links) - before
+            print(f"   +{gained} new  (total {len(all_links)})")
+
+            # If 0 links found, OLX likely served an empty page — retry
+            if gained == 0 and pg > 1:
+                wait_secs = (attempt + 1) * 20
+                print(f"   ✗ No links found — OLX may have blocked this page, waiting {wait_secs}s before retry")
+                await asyncio.sleep(wait_secs)
+                continue
+
             break
         else:
             print(f"   ✗ Skipping page {pg} after 3 failed attempts")
