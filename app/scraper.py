@@ -126,7 +126,7 @@ def ensure_table(engine):
             CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
                 listing_id    TEXT PRIMARY KEY,
                 title         TEXT,
-                price         BIGINT,
+                price         NUMERIC,
                 currency      TEXT,
                 area          TEXT,
                 num_rooms     INT,
@@ -160,12 +160,16 @@ def save_batch_to_db(data_list, engine):
     ]
     df = pd.DataFrame(data_list)
     df = df[[c for c in col_order if c in df.columns]]
+    # Replace NaN/NaT with None so Postgres doesn't choke on numeric columns
+    df = df.where(pd.notna(df), other=None)
     records = df.to_dict(orient="records")
 
     with engine.begin() as conn:
         for rec in records:
-            # Skip records with no listing_id — can't upsert without a key
+            # Skip records with no listing_id or that are 403 pages
             if not rec.get("listing_id"):
+                continue
+            if rec.get("title") and "403" in str(rec["title"]):
                 continue
             cols    = list(rec.keys())
             values  = [f":{c}" for c in cols]
@@ -363,7 +367,9 @@ async def scrape_ad(page, url):
         page.remove_listener("response", handle_response)
 
         page_title = await page.title()
-        if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]):
+        body_snippet = (await page.text_content("body") or "")[:500].lower()
+        if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]) \
+                or "403 error" in body_snippet or "access denied" in body_snippet:
             print("  BLOCKED — waiting 20s and skipping")
             await asyncio.sleep(20)
             return None
