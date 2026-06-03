@@ -808,10 +808,6 @@ async def warmup_browser(page):
     try:
         print("  [browser] warming up session on OLX homepage...")
         await page.goto("https://www.olx.uz/", wait_until="domcontentloaded", timeout=30000)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10000)
-        except Exception:
-            pass
         await page.wait_for_timeout(random.randint(3000, 5000))
         await human_scroll(page)
         print("  [browser] session ready.")
@@ -887,8 +883,9 @@ async def run_scrape():
                         "Target page", "browser has been closed",
                         "page has been closed", "Browser closed",
                         "context or browser", "Target closed",
+                        "Timeout", "timeout",
                     ]):
-                        print(f"  Browser crashed — restarting (attempt {attempt+1}/3)")
+                        print(f"  Browser crashed/timeout — restarting (attempt {attempt+1}/3)")
                         try:
                             await browser.close()
                         except Exception:
