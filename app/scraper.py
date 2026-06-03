@@ -40,7 +40,7 @@ LONG_BREAK_SECS       = (15, 25)
 SCROLL_PASSES         = (2, 3)
 SCROLL_DIST_PX        = (500, 1200)
 SCROLL_PAUSE          = (0.4, 0.9)
-BROWSER_RESTART_EVERY = 20
+BROWSER_RESTART_EVERY = 10
 BATCH_SIZE            = 1             # save every listing immediately
 
 CHROMIUM_ARGS = [
@@ -884,6 +884,7 @@ async def run_scrape():
                         "page has been closed", "Browser closed",
                         "context or browser", "Target closed",
                         "Timeout", "timeout",
+                        "Page crashed", "crashed",
                     ]):
                         print(f"  Browser crashed/timeout — restarting (attempt {attempt+1}/3)")
                         try:
