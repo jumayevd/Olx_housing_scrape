@@ -164,30 +164,37 @@ def save_batch_to_db(data_list, engine):
     df = df.where(pd.notna(df), other=None)
     records = df.to_dict(orient="records")
 
-    with engine.begin() as conn:
-        for rec in records:
-            # Skip records with no listing_id or that are 403 pages
-            if not rec.get("listing_id"):
-                continue
-            if rec.get("title") and "403" in str(rec["title"]):
-                continue
-            cols    = list(rec.keys())
-            values  = [f":{c}" for c in cols]
-            updates = ", ".join(
-                f"{c} = EXCLUDED.{c}"
-                for c in ["price", "currency", "views", "scraped_date", "negotiation", "location"]
-                if c in cols
-            )
-            sql = text(f"""
-                INSERT INTO {TABLE_NAME} ({", ".join(cols)}, first_seen, last_seen)
-                VALUES ({", ".join(values)}, :scraped_date, :scraped_date)
-                ON CONFLICT (listing_id) DO UPDATE SET
-                    {updates},
-                    last_seen = EXCLUDED.scraped_date
-            """)
-            conn.execute(sql, rec)
+    saved = 0
+    failed = 0
+    for rec in records:
+        # Skip records with no listing_id or 403 pages
+        if not rec.get("listing_id"):
+            continue
+        if rec.get("title") and "403" in str(rec["title"]):
+            continue
+        cols    = [str(c) for c in rec.keys()]
+        values  = [f":{c}" for c in cols]
+        updates = ", ".join(
+            f"{c} = EXCLUDED.{c}"
+            for c in ["price", "currency", "views", "scraped_date", "negotiation", "location"]
+            if c in cols
+        )
+        sql = text(f"""
+            INSERT INTO {TABLE_NAME} ({", ".join(cols)}, first_seen, last_seen)
+            VALUES ({", ".join(values)}, :scraped_date, :scraped_date)
+            ON CONFLICT (listing_id) DO UPDATE SET
+                {updates},
+                last_seen = EXCLUDED.scraped_date
+        """)
+        try:
+            with engine.begin() as conn:
+                conn.execute(sql, rec)
+            saved += 1
+        except Exception as e:
+            failed += 1
+            print(f"  [DB] ✗ Failed to save listing {rec.get('listing_id')}: {e}")
 
-    print(f"  [DB] ✓ {len(records)} listings upserted into '{TABLE_NAME}'.")
+    print(f"  [DB] ✓ {saved} saved, {failed} failed.")
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -370,9 +377,7 @@ async def scrape_ad(page, url):
         body_snippet = (await page.text_content("body") or "")[:500].lower()
         if any(x in page_title.lower() for x in ["403", "access denied", "captcha", "just a moment"]) \
                 or "403 error" in body_snippet or "access denied" in body_snippet:
-            print("  BLOCKED — waiting 20s and skipping")
-            await asyncio.sleep(20)
-            return None
+            raise Exception("BLOCKED_403")
 
         # Listing ID
         listing_id = None
@@ -589,6 +594,8 @@ async def scrape_ad(page, url):
         }
 
     except Exception as e:
+        if "BLOCKED_403" in str(e):
+            raise  # let caller handle retry
         print(f"  FAILED: {e}")
         return None
 
@@ -635,7 +642,19 @@ async def run_scrape():
                 browser, page = await make_browser_page(p)
 
             print(f"[{idx}/{len(all_links)}] {link.split('/')[-1][:60]}")
-            data = await scrape_ad(page, link)
+            data = None
+            for attempt in range(3):
+                try:
+                    data = await scrape_ad(page, link)
+                    break
+                except Exception as e:
+                    if "BLOCKED_403" in str(e):
+                        wait = (attempt + 1) * 30
+                        print(f"  BLOCKED — retry {attempt+1}/3 in {wait}s")
+                        await asyncio.sleep(wait)
+                    else:
+                        print(f"  FAILED: {e}")
+                        break
 
             if data:
                 batch_data.append(data)
