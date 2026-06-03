@@ -395,19 +395,41 @@ def _deep_get(d, *keys, default=None):
 
 async def extract_from_next_data(page):
     """
-    Pull listing fields from the __NEXT_DATA__ JSON blob.
-    OLX.uz is Next.js — all listing data is server-rendered into this tag,
-    so it's always present regardless of React render timing.
+    Pull listing fields from embedded page JSON.
+    Tries __NEXT_DATA__ (Next.js), window.__STORE__, window.__INITIAL_STATE__,
+    and any <script type="application/json"> tags.
     Returns a dict of whatever fields were found (may be partial).
     """
     result = {}
     try:
-        raw = await page.evaluate(
-            "() => document.getElementById('__NEXT_DATA__')?.textContent"
-        )
-        if not raw:
+        # Probe every known data-injection pattern in one evaluate call
+        probe = await page.evaluate("""() => {
+            // 1. Next.js standard
+            const nd = document.getElementById('__NEXT_DATA__');
+            if (nd && nd.textContent) return {src: '__NEXT_DATA__', raw: nd.textContent};
+
+            // 2. Common SPA window globals
+            for (const key of ['__STORE__', '__INITIAL_STATE__', '__PRELOADED_STATE__',
+                                '__APP_STATE__', '__DATA__', 'olxConfig', '__olxConfig']) {
+                if (window[key]) try { return {src: key, raw: JSON.stringify(window[key])}; } catch(e) {}
+            }
+
+            // 3. Any <script type="application/json"> or <script id=...> with JSON-looking content
+            for (const s of document.querySelectorAll('script')) {
+                const t = (s.textContent || '').trim();
+                if (t.startsWith('{') && t.length > 500 && (t.includes('"title"') || t.includes('"price"'))) {
+                    return {src: s.id || s.type || 'inline-script', raw: t};
+                }
+            }
+            return null;
+        }""")
+
+        if not probe:
+            print("  [page-data] no embedded JSON found on this page")
             return result
 
+        src = probe.get("src", "?")
+        raw = probe.get("raw", "")
         nd = json.loads(raw)
 
         # OLX Next.js path: props → pageProps → ad (or listing / adDetails)
@@ -419,10 +441,20 @@ async def extract_from_next_data(page):
             or {}
         )
 
+        # If not Next.js structure, try flat/store structures
+        if not ad and isinstance(nd, dict):
+            ad = (
+                nd.get("ad") or nd.get("listing") or nd.get("adDetails")
+                or _deep_get(nd, "data", "ad")
+                or _deep_get(nd, "state", "adDetails", "ad")
+                or {}
+            )
+
         if not ad:
-            # Log first 300 chars of top-level keys so we can tune if needed
-            print(f"  [__NEXT_DATA__] ad key not found. top keys: {list(nd.get('props',{}).get('pageProps',{}).keys())[:10]}")
+            print(f"  [page-data] src={src}, ad key missing. pageProps keys: {list(page_props.keys())[:12]}")
             return result
+
+        print(f"  [page-data] src={src}, ad keys: {list(ad.keys())[:12]}")
 
         # ── Title ────────────────────────────────────────────────
         result["title"] = clean(ad.get("title"))
@@ -521,17 +553,15 @@ async def scrape_ad(page, url):
 
         page.on("response", handle_response)
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass
+        # Wait for h1 — signals React has rendered. Skip networkidle: OLX analytics
+        # fire indefinitely and networkidle never settles, causing hangs.
         try:
             await page.wait_for_selector("h1", timeout=15000)
         except Exception:
             pass
         await page.wait_for_timeout(random.randint(*AD_WAIT_MS))
         await human_scroll(page)
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(1.5)
         page.remove_listener("response", handle_response)
 
         page_title = await page.title()
@@ -702,18 +732,20 @@ async def scrape_ad(page, url):
                 pass
 
         if not location:
-            try:
-                texts = await page.locator("p, span").all_inner_texts()
-                for t in texts:
-                    t = clean(t)
-                    if not t:
-                        continue
-                    if any(x in t.lower() for x in ["район", "ташкент", "toshkent", "область"]):
-                        if len(t) < 120:
-                            location = t
+            for loc_sel in [
+                '[data-testid="ad-location-link"]',
+                '[data-cy="ad-location"]',
+                '[data-testid="location-link"]',
+                '[class*="location"]',
+            ]:
+                try:
+                    el = page.locator(loc_sel)
+                    if await el.count() > 0:
+                        location = clean(await el.first.inner_text())
+                        if location:
                             break
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
         if not description:
             try:
