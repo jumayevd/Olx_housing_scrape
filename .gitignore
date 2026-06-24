@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Claude Code local settings — may contain tokens/secrets, never commit
+.claude/settings.local.json
+
+# Env / secrets
+.env
+*.env
