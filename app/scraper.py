@@ -67,7 +67,10 @@ LONG_BREAK_SECS       = (13, 22)
 SCROLL_PASSES         = (2, 3)
 SCROLL_DIST_PX        = (500, 1200)
 SCROLL_PAUSE          = (0.4, 0.8)
-BROWSER_RESTART_EVERY = 40            # plenty of memory — restart rarely
+# Tear Chromium down frequently — its memory grows across navigations and Railway
+# OOM-kills the service otherwise. 10 was the known-good value before it regressed
+# to 40. Tune via env if the container has more/less RAM.
+BROWSER_RESTART_EVERY = int(os.getenv("BROWSER_RESTART_EVERY", "10"))
 AD_ATTEMPTS           = int(os.getenv("AD_ATTEMPTS", "4"))   # was 5; no-price no longer retries
 BATCH_SIZE            = 1             # save every listing immediately
 
@@ -76,6 +79,11 @@ CHROMIUM_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
+    # Cap on-disk / media caches to curb memory growth. These do NOT touch the V8
+    # heap, so React still renders fully (unlike --js-flags=--max-old-space-size).
+    "--disk-cache-size=1",
+    "--media-cache-size=1",
+    "--disable-application-cache",
     # GPU not needed in headless
     "--disable-gpu",
     "--disable-accelerated-2d-canvas",
@@ -387,12 +395,12 @@ def save_batch_to_db(data_list, engine):
 
 # Block only images/media — they hold no listing data. CSS/JS load normally so
 # React renders fully (where the parameters live).
-BLOCKED_RESOURCES = {"image", "media"}
+BLOCKED_RESOURCES = {"image", "media", "font"}
 
 async def make_browser_page(p):
     browser = await p.chromium.launch(headless=True, slow_mo=60, args=CHROMIUM_ARGS)
     context = await browser.new_context(
-        viewport={"width": 1400, "height": 900},
+        viewport={"width": 1280, "height": 800},
         locale="ru-RU",
         timezone_id="Asia/Tashkent",
         user_agent=(
