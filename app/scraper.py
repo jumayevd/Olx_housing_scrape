@@ -20,7 +20,7 @@ import random
 import re
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pandas as pd
 from playwright.async_api import async_playwright
@@ -43,10 +43,10 @@ TABLE_NAME = os.getenv("TABLE_NAME", "olx_listings")
 # How many of the first ads to dump full diagnostics for (set DIAG_DUMP>0 to enable).
 DIAG_DUMP  = int(os.getenv("DIAG_DUMP", "0"))
 
-# Resume: skip listings already scraped within this many hours, so a restarted or
-# overlapping run continues where it left off instead of re-scraping from scratch.
-# (0 disables resume → always re-scrape everything.)
-RESUME_WINDOW_HOURS = float(os.getenv("RESUME_WINDOW_HOURS", "20"))
+# Resume: within a run, skip listings that already have TODAY's snapshot row, so a
+# restarted/overlapping run finishes today's snapshot instead of starting over.
+# Each new calendar day re-scrapes everything (a fresh daily snapshot).
+RESUME_SKIP_DONE_TODAY = os.getenv("RESUME_SKIP_DONE_TODAY", "true").lower() == "true"
 
 # Hard wall-clock budget for a single run. We stop cleanly when reached so a slow
 # run can never bleed past the next daily cron (which APScheduler would then skip
@@ -57,7 +57,7 @@ MAX_RUNTIME_HOURS = float(os.getenv("MAX_RUNTIME_HOURS", "22"))
 # TIMING  — balanced for completeness without tripping OLX blocks.
 # All knobs below are deliberately conservative; trim further only if blocks stay
 # rare. The big time win is NOT shorter sleeps but skipping the no-price retry
-# trap and resuming already-scraped listings (see RESUME_WINDOW_HOURS).
+# trap and resuming today's already-scraped listings (see RESUME_SKIP_DONE_TODAY).
 # ─────────────────────────────────────────────────────────────────
 AD_WAIT_MS            = (3500, 6000)   # buffer after page load
 BETWEEN_ADS           = (2.5, 5.0)
@@ -198,15 +198,16 @@ async def human_scroll(page, fast=False):
 # ─────────────────────────────────────────────────────────────────
 
 # The columns we store, in order. first_seen / last_seen intentionally removed.
+# snapshot_date is part of the PK: one row per listing per day (daily snapshots).
 COLUMNS = [
-    "listing_id", "olx_id", "title", "price", "currency", "area", "num_rooms",
-    "market_type", "views", "stair", "total_floors", "posted_date",
+    "listing_id", "snapshot_date", "olx_id", "title", "price", "currency", "area",
+    "num_rooms", "market_type", "views", "stair", "total_floors", "posted_date",
     "scraped_date", "negotiation", "seller", "location", "seller_joined",
     "description", "url",
 ]
 
-# Columns refreshed when we re-scrape an existing listing (everything except the id).
-UPDATE_COLUMNS = [c for c in COLUMNS if c != "listing_id"]
+# Columns refreshed on a same-day re-scrape (everything except the composite key).
+UPDATE_COLUMNS = [c for c in COLUMNS if c not in ("listing_id", "snapshot_date")]
 
 
 def get_engine():
@@ -225,11 +226,17 @@ def get_engine():
 
 
 def ensure_table(engine):
-    """Create the listings table if needed and migrate the schema in place."""
+    """Create the listings table if needed and migrate the schema in place.
+
+    Primary key is (listing_id, snapshot_date) so each daily run APPENDS a fresh
+    snapshot per listing — one row per listing per day — rather than overwriting.
+    A same-day re-scrape updates that day's row (idempotent resume).
+    """
     with engine.begin() as conn:
         conn.execute(text(f"""
             CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
-                listing_id    TEXT PRIMARY KEY,
+                listing_id    TEXT NOT NULL,
+                snapshot_date DATE NOT NULL DEFAULT CURRENT_DATE,
                 olx_id        BIGINT,
                 title         TEXT,
                 price         NUMERIC,
@@ -247,7 +254,8 @@ def ensure_table(engine):
                 location      TEXT,
                 seller_joined TEXT,
                 description   TEXT,
-                url           TEXT
+                url           TEXT,
+                PRIMARY KEY (listing_id, snapshot_date)
             )
         """))
         # Migrate existing tables: add olx_id/total_floors, drop first_seen/last_seen.
@@ -255,39 +263,47 @@ def ensure_table(engine):
         conn.execute(text(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS total_floors TEXT"))
         conn.execute(text(f"ALTER TABLE {TABLE_NAME} DROP COLUMN IF EXISTS first_seen"))
         conn.execute(text(f"ALTER TABLE {TABLE_NAME} DROP COLUMN IF EXISTS last_seen"))
-    print(f"  [DB] Table '{TABLE_NAME}' ready (first_seen/last_seen dropped).")
+        # Migrate a legacy single-column PK (listing_id) → (listing_id, snapshot_date).
+        conn.execute(text(f"ALTER TABLE {TABLE_NAME} ADD COLUMN IF NOT EXISTS snapshot_date DATE"))
+        conn.execute(text(
+            f"UPDATE {TABLE_NAME} SET snapshot_date = "
+            f"COALESCE(NULLIF(left(scraped_date, 10), '')::date, CURRENT_DATE) "
+            f"WHERE snapshot_date IS NULL"
+        ))
+        conn.execute(text(f"ALTER TABLE {TABLE_NAME} ALTER COLUMN snapshot_date SET NOT NULL"))
+        conn.execute(text(f"ALTER TABLE {TABLE_NAME} ALTER COLUMN snapshot_date SET DEFAULT CURRENT_DATE"))
+        conn.execute(text(f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint c
+                    JOIN pg_attribute a
+                      ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
+                    WHERE c.conrelid = '{TABLE_NAME}'::regclass
+                      AND c.contype = 'p' AND a.attname = 'snapshot_date'
+                ) THEN
+                    ALTER TABLE {TABLE_NAME} DROP CONSTRAINT IF EXISTS {TABLE_NAME}_pkey;
+                    ALTER TABLE {TABLE_NAME} ADD CONSTRAINT {TABLE_NAME}_pkey
+                        PRIMARY KEY (listing_id, snapshot_date);
+                END IF;
+            END $$;
+        """))
+    print(f"  [DB] Table '{TABLE_NAME}' ready (daily-snapshot mode: PK = listing_id + snapshot_date).")
 
 
-def load_recent_ids(engine, window_hours):
-    """Return the set of listing_ids scraped within the last `window_hours`.
-
-    Used to resume: a restarted/overlapping run skips these instead of redoing
-    them. scraped_date is stored as 'YYYY-MM-DD HH:MM:SS' in server-local time
-    (same clock as now_str), so we compare against datetime.now().
-    """
-    if not window_hours or window_hours <= 0:
+def load_done_today(engine):
+    """listing_ids that already have a snapshot row for today — skipped on resume."""
+    if not RESUME_SKIP_DONE_TODAY:
         return set()
-    cutoff = datetime.now() - timedelta(hours=window_hours)
-    recent = set()
     try:
         with engine.begin() as conn:
             rows = conn.execute(
-                text(f"SELECT listing_id, scraped_date FROM {TABLE_NAME} "
-                     f"WHERE scraped_date IS NOT NULL")
+                text(f"SELECT listing_id FROM {TABLE_NAME} WHERE snapshot_date = CURRENT_DATE")
             ).fetchall()
     except Exception as e:
-        print(f"  [resume] could not load recent ids (continuing full scrape): {e}")
+        print(f"  [resume] could not load today's snapshot ids (continuing full scrape): {e}")
         return set()
-    for lid, sd in rows:
-        if not lid or not sd:
-            continue
-        try:
-            when = datetime.strptime(str(sd), "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-        if when >= cutoff:
-            recent.add(lid)
-    return recent
+    return {r[0] for r in rows if r[0]}
 
 
 def tidy_existing_location(loc):
@@ -351,7 +367,7 @@ def save_batch_to_db(data_list, engine):
         sql = text(f"""
             INSERT INTO {TABLE_NAME} ({", ".join(cols)})
             VALUES ({", ".join(values)})
-            ON CONFLICT (listing_id) DO UPDATE SET
+            ON CONFLICT (listing_id, snapshot_date) DO UPDATE SET
                 {updates}
         """)
         try:
@@ -1009,6 +1025,7 @@ async def scrape_ad(page, url, diag=False):
 
     return {
         "listing_id":    listing_id,
+        "snapshot_date": datetime.now().strftime("%Y-%m-%d"),
         "olx_id":        olx_id,
         "title":         title,
         "price":         price,
@@ -1091,16 +1108,16 @@ async def _run_scrape_inner():
         all_links = list(set(await get_all_links(p, BASE_URL, MAX_PAGES)))
         print(f"\nTotal unique links: {len(all_links)}")
 
-        # ── Resume: drop listings already scraped recently so we continue rather
-        #    than start from scratch (after a restart, OOM, or budget cutoff).
-        recent_ids = load_recent_ids(engine, RESUME_WINDOW_HOURS)
-        if recent_ids:
+        # ── Resume: drop listings already snapshotted today so we finish today's
+        #    snapshot rather than start over (after a restart, OOM, or budget cut).
+        done_today = load_done_today(engine)
+        if done_today:
             before = len(all_links)
             all_links = [l for l in all_links
-                         if listing_id_from_url(l) not in recent_ids]
+                         if listing_id_from_url(l) not in done_today]
             skipped_recent = before - len(all_links)
-            print(f"  Resume: {skipped_recent} listings scraped in last "
-                  f"{RESUME_WINDOW_HOURS:g}h skipped — {len(all_links)} to scrape this run.")
+            print(f"  Resume: {skipped_recent} listings already snapshotted today "
+                  f"skipped — {len(all_links)} to scrape this run.")
 
         browser, page = await make_browser_page(p)
         await warmup_browser(page)
@@ -1109,7 +1126,7 @@ async def _run_scrape_inner():
             ad_counter += 1
 
             # ── Wall-clock budget: stop cleanly before bleeding into the next
-            #    daily cron. The next run resumes via load_recent_ids().
+            #    daily cron. The next run resumes via load_done_today().
             if budget_secs and (time.monotonic() - start_ts) > budget_secs:
                 budget_hit = True
                 print(f"\n  ⏲  Reached {MAX_RUNTIME_HOURS:g}h runtime budget at "
