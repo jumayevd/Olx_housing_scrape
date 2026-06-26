@@ -72,10 +72,11 @@ SCROLL_PAUSE          = (0.4, 0.8)
 # that's 6 navigations/page/browser — well under the ~40 that OOM'd before, and we
 # also block fonts + cap caches. Raise if the container has lots of RAM.
 BROWSER_RESTART_EVERY = int(os.getenv("BROWSER_RESTART_EVERY", "18"))
-# How many ad pages to scrape in PARALLEL. This is the main speed lever (~Nx). It
-# also multiplies request rate (block risk) and peak memory — dial DOWN to 2 if
-# OLX starts 403-blocking or the service OOMs; UP if there's RAM headroom.
-OLX_CONCURRENCY       = int(os.getenv("OLX_CONCURRENCY", "3"))
+# How many ad pages to scrape in PARALLEL. Default 1 (sequential): testing showed
+# OLX 403-blocks almost every request at concurrency 3 — it can't be parallelized
+# without getting blocked. Left as an env knob in case OLX tolerance changes, but
+# raise above 1 only if you confirm blocks stay rare.
+OLX_CONCURRENCY       = int(os.getenv("OLX_CONCURRENCY", "1"))
 SLOW_MO               = int(os.getenv("SLOW_MO", "50"))   # ms added per Playwright action
 AD_ATTEMPTS           = int(os.getenv("AD_ATTEMPTS", "4"))   # was 5; no-price no longer retries
 BATCH_SIZE            = 1             # save every listing immediately
@@ -469,8 +470,8 @@ async def get_all_links(p, base_url, max_pages):
     all_links = set()
     browser, page = await make_browser_page(p)
 
-    empty_streak = 0   # consecutive pages with NO listing links at all
-    nogain_streak = 0  # consecutive pages adding 0 new (duplicates/end)
+    empty_streak = 0    # consecutive pages with NO listing links at all
+    lowgain_streak = 0  # consecutive pages that are mostly already-seen (tail)
 
     for pg in range(1, max_pages + 1):
         url = page_url(base_url, pg)
@@ -534,14 +535,21 @@ async def get_all_links(p, base_url, max_pages):
             print(f"   ✗ Skipping page {pg} after 3 failed attempts")
 
         # ── End-of-pagination detection ───────────────────────────
-        empty_streak  = empty_streak + 1  if page_raw == 0    else 0
-        nogain_streak = nogain_streak + 1 if page_gained == 0 else 0
+        # The feed is newest-first and shifts as ads post, so tail pages re-show
+        # mostly-seen listings with a trickle of genuinely new ones — page_gained
+        # rarely hits exactly 0, which is why a "no-gain" test never tripped and we
+        # ground on to the ceiling. Detect the tail by LOW-GAIN RATIO instead: a
+        # page that's <20% new means we're past the fresh listings.
+        empty_streak = empty_streak + 1 if page_raw == 0 else 0
+        low_gain = page_raw > 0 and page_gained < max(3, page_raw * 0.2)
+        lowgain_streak = lowgain_streak + 1 if low_gain else 0
 
         if pg > 1 and empty_streak >= 2:
             print(f"\n  ✓ Reached end of results — {empty_streak} empty pages. Stopping at page {pg}.")
             break
-        if pg > 1 and nogain_streak >= 4:
-            print(f"\n  ✓ No new listings for {nogain_streak} pages — assuming end. Stopping at page {pg}.")
+        if pg > 1 and lowgain_streak >= 4:
+            print(f"\n  ✓ Tail reached — {lowgain_streak} pages <20% new listings. "
+                  f"Stopping at page {pg} ({len(all_links)} collected).")
             break
 
         if pg < max_pages:
