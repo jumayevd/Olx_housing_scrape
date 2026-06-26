@@ -67,10 +67,16 @@ LONG_BREAK_SECS       = (13, 22)
 SCROLL_PASSES         = (2, 3)
 SCROLL_DIST_PX        = (500, 1200)
 SCROLL_PAUSE          = (0.4, 0.8)
-# Tear Chromium down frequently — its memory grows across navigations and Railway
-# OOM-kills the service otherwise. 10 was the known-good value before it regressed
-# to 40. Tune via env if the container has more/less RAM.
-BROWSER_RESTART_EVERY = int(os.getenv("BROWSER_RESTART_EVERY", "10"))
+# Scrape this many ads per browser, ACROSS all concurrent pages, then recycle the
+# browser to cap memory (Chromium grows across navigations). With concurrency=3
+# that's 6 navigations/page/browser — well under the ~40 that OOM'd before, and we
+# also block fonts + cap caches. Raise if the container has lots of RAM.
+BROWSER_RESTART_EVERY = int(os.getenv("BROWSER_RESTART_EVERY", "18"))
+# How many ad pages to scrape in PARALLEL. This is the main speed lever (~Nx). It
+# also multiplies request rate (block risk) and peak memory — dial DOWN to 2 if
+# OLX starts 403-blocking or the service OOMs; UP if there's RAM headroom.
+OLX_CONCURRENCY       = int(os.getenv("OLX_CONCURRENCY", "3"))
+SLOW_MO               = int(os.getenv("SLOW_MO", "50"))   # ms added per Playwright action
 AD_ATTEMPTS           = int(os.getenv("AD_ATTEMPTS", "4"))   # was 5; no-price no longer retries
 BATCH_SIZE            = 1             # save every listing immediately
 
@@ -397,8 +403,25 @@ def save_batch_to_db(data_list, engine):
 # React renders fully (where the parameters live).
 BLOCKED_RESOURCES = {"image", "media", "font"}
 
-async def make_browser_page(p):
-    browser = await p.chromium.launch(headless=True, slow_mo=60, args=CHROMIUM_ARGS)
+_STEALTH_JS = """
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    window.chrome = { runtime: {} };
+    Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU','ru','en-US'] });
+"""
+
+
+async def _block_resources(route):
+    if route.request.resource_type in BLOCKED_RESOURCES:
+        await route.abort()
+    else:
+        await route.continue_()
+
+
+async def make_browser(p):
+    """Launch a browser + context. Stealth init is applied at the context level
+    so every page opened from it inherits it (supports concurrent pages)."""
+    browser = await p.chromium.launch(headless=True, slow_mo=SLOW_MO, args=CHROMIUM_ARGS)
     context = await browser.new_context(
         viewport={"width": 1280, "height": 800},
         locale="ru-RU",
@@ -409,21 +432,21 @@ async def make_browser_page(p):
             "Chrome/124.0.0.0 Safari/537.36"
         ),
     )
+    await context.add_init_script(_STEALTH_JS)
+    return browser, context
+
+
+async def new_page(context):
+    """Open a fresh page in `context` with image/media/font blocking."""
     page = await context.new_page()
+    await page.route("**/*", _block_resources)
+    return page
 
-    async def block_resources(route):
-        if route.request.resource_type in BLOCKED_RESOURCES:
-            await route.abort()
-        else:
-            await route.continue_()
-    await page.route("**/*", block_resources)
 
-    await page.add_init_script("""
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        window.chrome = { runtime: {} };
-        Object.defineProperty(navigator, 'plugins',   { get: () => [1,2,3,4,5] });
-        Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU','ru','en-US'] });
-    """)
+async def make_browser_page(p):
+    """Browser + a single page — used by link collection (single-threaded)."""
+    browser, context = await make_browser(p)
+    page = await new_page(context)
     return browser, page
 
 
@@ -1103,13 +1126,17 @@ async def _run_scrape_inner():
         print(f"FATAL DB ERROR: {e}")
         return 0
 
-    batch_data = []
-    ad_counter = 0
-    skipped_removed = 0
     skipped_recent = 0
     budget_hit = False
     start_ts = time.monotonic()
     budget_secs = MAX_RUNTIME_HOURS * 3600 if MAX_RUNTIME_HOURS > 0 else None
+
+    def over_budget():
+        return bool(budget_secs and (time.monotonic() - start_ts) > budget_secs)
+
+    # Workers mutate these; asyncio is single-threaded so plain dict updates between
+    # awaits are race-free (no locks needed).
+    stats = {"ad": 0, "saved": 0, "removed": 0, "incomplete": 0}
 
     async with async_playwright() as p:
         print("Collecting listing links...")
@@ -1127,65 +1154,45 @@ async def _run_scrape_inner():
             print(f"  Resume: {skipped_recent} listings already snapshotted today "
                   f"skipped — {len(all_links)} to scrape this run.")
 
-        browser, page = await make_browser_page(p)
-        await warmup_browser(page)
+        total = len(all_links)
+        queue = asyncio.Queue()
+        for i, link in enumerate(all_links, start=1):
+            queue.put_nowait((i, link))
 
-        for idx, link in enumerate(all_links, start=1):
-            ad_counter += 1
+        # Each browser handles ~BROWSER_RESTART_EVERY ads across all its pages, then
+        # is recycled to cap memory. Split that quota evenly among the workers.
+        per_worker = max(1, BROWSER_RESTART_EVERY // max(1, OLX_CONCURRENCY))
 
-            # ── Wall-clock budget: stop cleanly before bleeding into the next
-            #    daily cron. The next run resumes via load_done_today().
-            if budget_secs and (time.monotonic() - start_ts) > budget_secs:
-                budget_hit = True
-                print(f"\n  ⏲  Reached {MAX_RUNTIME_HOURS:g}h runtime budget at "
-                      f"listing {idx}/{len(all_links)} — stopping cleanly; "
-                      f"next run resumes the rest.\n")
-                break
-
-            if idx > 1 and (idx - 1) % BROWSER_RESTART_EVERY == 0:
-                print(f"\n  ── restarting browser at listing {idx} ──\n")
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
-                await asyncio.sleep(5)
-                browser, page = await make_browser_page(p)
-                await warmup_browser(page)
-
-            print(f"[{idx}/{len(all_links)}] {link.split('/')[-1][:60]}")
-            diag = ad_counter <= DIAG_DUMP
+        async def scrape_one(page, idx, link, context):
+            """Scrape one link with retries. Returns (data, status, page).
+            status: 'saved' | 'removed' | 'incomplete' | 'browser_dead'.
+            A recoverable page crash swaps in a fresh page from `context`."""
+            diag = stats["ad"] <= DIAG_DUMP
             data = None
-            skip_permanently = False
-
             for attempt in range(AD_ATTEMPTS):
                 try:
                     data = await scrape_ad(page, link, diag=diag)
-                    # A real render yields a title AND at least one structured
-                    # detail (price / area / rooms). Price alone is NOT required:
-                    # many listings are price-on-request / договорная, and gating
-                    # on price made those retry 5× and get discarded every run —
-                    # the main reason a run never finished. An empty React shell
-                    # (title from <title> but no params) still retries.
+                    # Real render = title AND one structured detail (price/area/rooms).
+                    # Price alone is NOT required (price-on-request listings are valid);
+                    # an empty React shell (title only, no params) still retries.
                     has_detail = data and (
                         data.get("price") or data.get("area") or data.get("num_rooms")
                     )
                     if data and not (data.get("title") and has_detail):
                         raise Exception("RENDER_FAILED")
-                    break
+                    return data, "saved", page
                 except NotAListing as e:
-                    print(f"  ⏭  skipped (not a listing): {e}")
-                    skip_permanently = True
-                    data = None
-                    break
+                    print(f"  ⏭  [{idx}] skipped (not a listing): {e}")
+                    return None, "removed", page
                 except Exception as e:
                     err = str(e)
                     if "BLOCKED_403" in err:
-                        wait = (attempt + 1) * 30
-                        print(f"  BLOCKED — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
+                        wait = (attempt + 1) * 20
+                        print(f"  [{idx}] BLOCKED — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
                         await asyncio.sleep(wait)
                     elif "RENDER_FAILED" in err:
-                        wait = (attempt + 1) * 10
-                        print(f"  Page rendered incomplete — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
+                        wait = (attempt + 1) * 8
+                        print(f"  [{idx}] render incomplete — retry {attempt+1}/{AD_ATTEMPTS} in {wait}s")
                         await asyncio.sleep(wait)
                         data = None
                     elif any(x in err for x in [
@@ -1194,57 +1201,87 @@ async def _run_scrape_inner():
                         "context or browser", "Target closed",
                         "Timeout", "timeout", "Page crashed", "crashed",
                     ]):
-                        print(f"  Browser crashed/timeout — restarting (attempt {attempt+1}/{AD_ATTEMPTS})")
+                        print(f"  [{idx}] page crashed — recreating (attempt {attempt+1}/{AD_ATTEMPTS})")
                         try:
-                            await browser.close()
+                            await page.close()
                         except Exception:
                             pass
-                        await asyncio.sleep(5)
-                        browser, page = await make_browser_page(p)
-                        await warmup_browser(page)
+                        try:
+                            page = await new_page(context)
+                        except Exception:
+                            return None, "browser_dead", page
                     else:
-                        print(f"  FAILED: {e}")
-                        break
+                        print(f"  [{idx}] FAILED: {e}")
+                        return None, "incomplete", page
+            return (data, "saved", page) if data else (None, "incomplete", page)
 
-            if skip_permanently:
-                skipped_removed += 1
-            elif data:
-                batch_data.append(data)
-                print(
-                    f"  ✓  rooms={data['num_rooms']}  area={data['area']}  "
-                    f"floor={data['stair']}/{data['total_floors']}  "
-                    f"price={data['price']} {data['currency']}  "
-                    f"type={str(data['market_type'])[:18]}  loc={str(data['location'])[:30]}"
+        async def worker(page, context):
+            """Pull links off the shared queue until this browser's quota is hit,
+            the queue drains, or the budget runs out."""
+            done = 0
+            while done < per_worker:
+                if over_budget():
+                    return
+                try:
+                    idx, link = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+                done += 1
+                stats["ad"] += 1
+                print(f"[{idx}/{total}] {link.split('/')[-1][:60]}")
+                data, status, page = await scrape_one(page, idx, link, context)
+                if status == "browser_dead":
+                    await queue.put((idx, link))   # retry under a fresh browser
+                    return
+                if status == "removed":
+                    stats["removed"] += 1
+                elif data:
+                    save_batch_to_db([data], engine)
+                    stats["saved"] += 1
+                    print(f"  ✓ [{idx}] rooms={data['num_rooms']} area={data['area']} "
+                          f"floor={data['stair']}/{data['total_floors']} "
+                          f"price={data['price']} {data['currency']} "
+                          f"loc={str(data['location'])[:30]}")
+                else:
+                    stats["incomplete"] += 1
+                    print(f"  ✗ [{idx}] incomplete after retries")
+                await short_delay(*BETWEEN_ADS)
+
+        # ── Outer loop: recycle the browser until the queue drains. Within each
+        #    browser, OLX_CONCURRENCY pages scrape in parallel.
+        print(f"\nScraping {total} ads — {OLX_CONCURRENCY} parallel pages, "
+              f"browser recycled every ~{BROWSER_RESTART_EVERY} ads.\n")
+        while not queue.empty() and not over_budget():
+            browser, context = await make_browser(p)
+            try:
+                pages = [await new_page(context) for _ in range(OLX_CONCURRENCY)]
+                await warmup_browser(pages[0])
+                await asyncio.gather(
+                    *[worker(pages[i], context) for i in range(OLX_CONCURRENCY)],
+                    return_exceptions=True,
                 )
-            else:
-                print("  ✗ skipped (incomplete after retries)")
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            if not queue.empty() and not over_budget():
+                await asyncio.sleep(random.uniform(2, 4))   # breather between browsers
 
-            if len(batch_data) >= BATCH_SIZE:
-                save_batch_to_db(batch_data, engine)
-                batch_data.clear()
-
-            await short_delay(*BETWEEN_ADS)
-
-            if ad_counter % LONG_BREAK_EVERY == 0:
-                secs = random.uniform(*LONG_BREAK_SECS)
-                print(f"\n  ── pause {secs:.0f}s ──\n")
-                await asyncio.sleep(secs)
-
-        try:
-            await browser.close()
-        except Exception:
-            pass
-
-    if batch_data:
-        save_batch_to_db(batch_data, engine)
+        budget_hit = over_budget()
+        if budget_hit:
+            print(f"\n  ⏲  Reached {MAX_RUNTIME_HOURS:g}h runtime budget — stopping "
+                  f"cleanly; next run resumes the rest.\n")
 
     status = "STOPPED (budget)" if budget_hit else "DONE"
     elapsed_h = (time.monotonic() - start_ts) / 3600
     print(f"\n{'='*55}")
-    print(f"  {status}  —  {ad_counter} ads processed, {skipped_removed} removed/skipped, "
-          f"{skipped_recent} resumed-skip  —  {elapsed_h:.1f}h  —  {now_str()}")
+    print(f"  {status}  —  {stats['ad']} processed "
+          f"({stats['saved']} saved, {stats['removed']} removed, "
+          f"{stats['incomplete']} incomplete), {skipped_recent} resumed-skip  —  "
+          f"{elapsed_h:.1f}h  —  {now_str()}")
     print(f"{'='*55}\n")
-    return ad_counter
+    return stats["ad"]
 
 
 if __name__ == "__main__":
